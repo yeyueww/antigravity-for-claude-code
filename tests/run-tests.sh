@@ -659,7 +659,7 @@ out=$("$DELEGATE" --tier bogus "hi" 2>/dev/null); rc=$?
 check "explicit --tier bogus -> exit 1" 1 "$rc"
 
 # agy missing on PATH -> exit 13 + AGY_MISSING signal (PATH without the stub or real agy)
-out=$(PATH="/usr/bin:/bin" "$DELEGATE" "hi" 2>&1); rc=$?
+out=$(PATH="$TMP/min" "$DELEGATE" "hi" 2>&1); rc=$?
 check "agy missing -> exit 13 + AGY_MISSING signal" 13 "$rc" "AGY_MISSING" "$out"
 
 # --print-command: dry run prints the resolved agy invocation and exits 0 (agy not run)
@@ -670,7 +670,7 @@ out=$("$DELEGATE" --mode auto --print-command "hi" 2>/dev/null); rc=$?
 check "--mode auto accepted (agy 1.3.5+)" 0 "$rc" "--mode auto" "$out"
 out=$("$DELEGATE" --mode bogus --print-command "hi" 2>/dev/null); rc=$?
 check "--mode bogus rejected -> exit 1" 1 "$rc"
-out=$(PATH="/usr/bin:/bin" "$DELEGATE" --print-command "hi" 2>/dev/null); rc=$?
+out=$(PATH="$TMP/min" "$DELEGATE" --print-command "hi" 2>/dev/null); rc=$?
 check "--print-command works without agy on PATH" 0 "$rc" "--print-timeout" "$out"
 # agy 1.1.18 made a valueless flag after -p an error (`--print --sandbox 'task'` used to run
 # with the prompt "--sandbox" and no sandbox; verified on 1.1.25: rc 2, "-p took
@@ -1038,7 +1038,7 @@ else echo "FAIL: inject-policy off (rc=$rc, out='${out:0:40}')"; FAIL=$((FAIL+1)
 # check-agy: exits 0 whether agy is present (stub) or absent, and warns when absent
 out=$("$HOOKS/check-agy.sh" 2>/dev/null); rc=$?
 check "check-agy (agy present) -> exit 0" 0 "$rc"
-err=$( { PATH="/usr/bin:/bin" "$HOOKS/check-agy.sh" >/dev/null; } 2>&1 ); rc=$?
+err=$( { PATH="$TMP/min" "$HOOKS/check-agy.sh" >/dev/null; } 2>&1 ); rc=$?
 check "check-agy (agy absent) -> exit 0 + warns" 0 "$rc" "not on PATH" "$err"
 
 # hooks.json structural shape (all events: command hooks referencing the plugin root)
@@ -1097,6 +1097,15 @@ for p in './agy-delegate "x"' '/tmp/agy-delegate "x"' '../../agy-job "x"' '.\agy
   if [ "$rc" = 2 ]; then echo "ok: gate blocks $p"; PASS=$((PASS+1));
   else echo "FAIL: gate allowed $p (rc=$rc)"; FAIL=$((FAIL+1)); fi
 done
+# ACP transport flags are value-taking options the subagent may pass.
+for p in 'agy-delegate --transport acp --approve execute --dir . "x"' 'agy-job start --approve edit,execute "x"'; do
+  rc="$(gate_path_rc "$p")"
+  if [ "$rc" = 0 ]; then echo "ok: gate allows ACP flags: $p"; PASS=$((PASS+1));
+  else echo "FAIL: gate blocked ACP flags: $p (rc=$rc)"; FAIL=$((FAIL+1)); fi
+done
+rc="$(gate_path_rc 'agy-delegate --approve execute --dir /etc "x"')"
+if [ "$rc" = 2 ]; then echo "ok: --approve consumes one value, so a following --dir is still checked"; PASS=$((PASS+1));
+else echo "FAIL: --approve let an out-of-cwd --dir through (rc=$rc)"; FAIL=$((FAIL+1)); fi
 # The guard the loop above needed: prove the payload actually reaches the rule.
 if [ "$(gate_path_rc 'agy-delegate "x"')" = 0 ]; then
   echo "ok: the path-form harness builds payloads the gate can parse"; PASS=$((PASS+1));
@@ -3202,6 +3211,112 @@ probe_single_bad="$(probe_doctor 1.5.9 "gemini-3.6-flash-low")"
 if has 'does NOT take effect' "$probe_single_bad"; then
   echo "ok: single-column /model mismatch still warns (cut -s -f2 guard)"; PASS=$((PASS+1));
 else echo "FAIL: single-column /model mismatch was accepted: $probe_single_bad"; FAIL=$((FAIL+1)); fi
+
+echo "== agy-delegate.sh: ACP transport =="
+# A fake `agy` whose --help advertises `acp` and whose `agy acp` is a scripted ACP server
+# (tests/fake-acp-agy.py). Every other section above uses the print-mode stub, whose
+# --help has no `acp`, so `--transport auto` keeps them on the print path.
+mkdir -p "$TMP/acpbin"
+cp "$HERE/fake-acp-agy.py" "$TMP/acpbin/agy"; chmod +x "$TMP/acpbin/agy"
+ACPLOG="$TMP/acp.log"
+acp_run() { # env-prefixed: STUB_ACP_MODE=... acp_run [delegate args...]; stdout+stderr -> $out, rc -> $rc
+  : > "$ACPLOG"
+  out=$(PATH="$TMP/acpbin:$PATH" STUB_ACP_LOG="$ACPLOG" AGY_ACP_SHUTDOWN_GRACE=3 "$DELEGATE" "$@" 2>&1); rc=$?
+}
+acp_log_has() { grep -qF -- "$1" "$ACPLOG"; }
+acp_check_log() { # desc  needle
+  if acp_log_has "$2"; then echo "ok: $1"; PASS=$((PASS+1));
+  else echo "FAIL: $1 (no '$2' in the ACP log)"; sed 's/^/    /' "$ACPLOG" | head -20; FAIL=$((FAIL+1)); fi
+}
+
+# transport selection
+out=$(PATH="$TMP/acpbin:$PATH" "$DELEGATE" --print-command "hi" 2>&1); rc=$?
+check "auto picks ACP when agy --help lists acp (dry run)" 0 "$rc" "runs: agy acp" "$out"
+check "ACP dry run shows the client and the resolved model" 0 "$rc" "agy_acp.py --model" "$out"
+for fl in "--read-only" "--allow-url" "--json-schema {}" "--settings {}"; do
+  # shellcheck disable=SC2086  # word-split the flag and its value on purpose
+  out=$(PATH="$TMP/acpbin:$PATH" "$DELEGATE" $fl --print-command "hi" 2>&1); rc=$?
+  check "auto falls back to print for ${fl%% *}" 0 "$rc" "--print-timeout" "$out"
+done
+out=$(PATH="$TMP/acpbin:$PATH" "$DELEGATE" --print-command "/clear the cache" 2>&1); rc=$?
+check "auto falls back to print for a leading-slash prompt" 0 "$rc" "--print-timeout" "$out"
+out=$(PATH="$TMP/acpbin:$PATH" "$DELEGATE" --allow-slash-commands --print-command "/goal x" 2>&1); rc=$?
+check "--allow-slash-commands keeps a leading-slash prompt on ACP" 0 "$rc" "runs: agy acp" "$out"
+out=$(PATH="$TMP/acpbin:$PATH" "$DELEGATE" --transport print --print-command "hi" 2>&1); rc=$?
+check "--transport print forces print mode" 0 "$rc" "--print-timeout" "$out"
+out=$(PATH="$TMP/acpbin:$PATH" AGY_TRANSPORT=print "$DELEGATE" --print-command "hi" 2>&1); rc=$?
+check "AGY_TRANSPORT=print forces print mode" 0 "$rc" "--print-timeout" "$out"
+out=$(PATH="$TMP/acpbin:$PATH" "$DELEGATE" --transport acp --read-only --print-command "hi" 2>&1); rc=$?
+check "--transport acp + --read-only refuses instead of falling back" 1 "$rc" "cannot be enforced over ACP" "$out"
+out=$("$DELEGATE" --transport acp "hi" 2>&1); rc=$?
+check "--transport acp on an agy without acp refuses" 1 "$rc" "no \`acp\` subcommand" "$out"
+out=$(PATH="$TMP/acpbin:$PATH" "$DELEGATE" --transport print --approve execute "hi" 2>&1); rc=$?
+check "--approve with --transport print refuses" 1 "$rc" "needs the ACP transport" "$out"
+out=$(PATH="$TMP/acpbin:$PATH" "$DELEGATE" --transport bogus "hi" 2>&1); rc=$?
+check "--transport bogus rejected" 1 "$rc" "invalid --transport" "$out"
+out=$(PATH="$TMP/min" "$DELEGATE" --transport acp --print-command "hi" 2>&1); rc=$?
+check "--transport acp dry run works without agy on PATH" 0 "$rc" "runs: agy acp" "$out"
+
+# a normal turn
+STUB_ACP_MODE=ok acp_run "hello"
+check "ACP turn returns the reassembled reply" 0 "$rc" "ACP_OK model=gemini-4-hydrogen-high mode=default" "$out"
+check "ACP turn reports AGY_USAGE with transport=acp" 0 "$rc" '"transport": "acp"' "$out"
+check "ACP usage maps cachedReadTokens -> cache_read" 0 "$rc" '"cache_read": 40' "$out"
+check "ACP AGY_USAGE carries the session id" 0 "$rc" '"conversation_id": "stub-session-1"' "$out"
+if has "FAKE_ACP_AGY_PRINT_MODE" "$out"; then echo "FAIL: ACP turn fell into print mode"; FAIL=$((FAIL+1));
+else echo "ok: ACP turn never ran agy in print mode"; PASS=$((PASS+1)); fi
+acp_check_log "ACP client closes the session when done" "session/close"
+STUB_ACP_MODE=ok acp_run --mode accept-edits --effort low -m "gemini-4-argon-high" -d "$TMP" "hello"
+check "ACP: slug model, --mode, raw --effort and --add-dir reach the session" 0 "$rc" "model=gemini-4-argon-high mode=accept-edits effort=low dirs=1" "$out"
+STUB_ACP_MODE=ok acp_run --continue "hello"
+check "ACP --continue resumes the newest session for this cwd" 0 "$rc" "start=resumed:prev-1" "$out"
+STUB_ACP_MODE=ok acp_run --conversation conv-42 "hello"
+check "ACP --conversation resumes that session" 0 "$rc" "start=resumed:conv-42" "$out"
+STUB_ACP_MODE=ok STUB_ACP_SESSIONS='[]' acp_run --continue "hello"
+check "ACP --continue with no history starts a new session" 0 "$rc" "start=new" "$out"
+python3 -c 'import sys; sys.stdout.write("x" * 200000)' > "$TMP/acp-big.txt"
+STUB_ACP_MODE=len acp_run - < "$TMP/acp-big.txt"
+check "ACP carries a 200 KB prompt over the pipe (no E2BIG)" 0 "$rc" "LEN=200000" "$out"
+
+# model fallback: the ACP client reports an unknown model with print mode's
+# `Available models:` block, so the wrapper's one-hop fallback works unchanged.
+STUB_ACP_MODE=ok acp_run --tier pro "hello"
+check "ACP pro tier falls back in one hop when Carbon is not on the plan" 0 "$rc" "fell back to Gemini 4 Argon (High)" "$out"
+check "ACP pro fallback runs on the fallback model" 0 "$rc" "model=gemini-4-argon-high" "$out"
+STUB_ACP_MODE=ok acp_run -m "No Such Model" "hello"
+check "ACP unknown --model -> exit 14" 14 "$rc" "MODEL_UNAVAILABLE" "$out"
+
+# permissions: the request reaches the client
+STUB_ACP_MODE=permission acp_run "run it"
+check "ACP permission request denied by default -> exit 15" 15 "$rc" "PERMISSION_DENIED" "$out"
+check "ACP denial names the tool" 15 "$rc" "denied: run_command" "$out"
+check "ACP denial suggests --approve" 15 "$rc" "--approve" "$out"
+acp_check_log "ACP client answered the request with the reject option" '"optionId": "deny"'
+STUB_ACP_MODE=permission acp_run --approve execute "run it"
+check "ACP --approve execute allows just that request" 0 "$rc" "RAN" "$out"
+STUB_ACP_MODE=permission acp_run --approve edit "run it"
+check "ACP --approve edit does not cover execute" 15 "$rc" "denied: run_command" "$out"
+STUB_ACP_MODE=permission acp_run --approve run_command "run it"
+check "ACP --approve accepts a tool name" 0 "$rc" "RAN" "$out"
+STUB_ACP_MODE=permission acp_run --yolo "run it"
+check "ACP --yolo approves the request" 0 "$rc" "RAN" "$out"
+acp_check_log "ACP --yolo starts agy acp with --dangerously-skip-permissions" "argv acp --dangerously-skip-permissions"
+
+# failures keep the exit-code contract
+STUB_ACP_MODE=quota acp_run "hello"
+check "ACP quota error -> exit 10" 10 "$rc" "QUOTA_EXHAUSTED" "$out"
+STUB_ACP_MODE=auth acp_run "hello"
+check "ACP auth error -> exit 11" 11 "$rc" "AUTH_REQUIRED" "$out"
+STUB_ACP_MODE=slow AGY_ACP_CANCEL_GRACE=5 acp_run --timeout 2s "hello"
+check "ACP --timeout cancels the turn -> exit 12" 12 "$rc" "TIMEOUT" "$out"
+check "ACP timeout keeps the partial reply" 12 "$rc" "PARTIAL" "$out"
+acp_check_log "ACP timeout sends session/cancel" "session/cancel"
+t0=$(date +%s)
+STUB_ACP_MODE=linger STUB_ACP_LINGER=60 acp_run "hello"
+t1=$(date +%s)
+check "ACP turn succeeds even when agy acp lingers after EOF" 0 "$rc" "ACP_OK" "$out"
+if [ $(( t1 - t0 )) -lt 30 ]; then echo "ok: ACP client terminates a lingering agy acp ($(( t1 - t0 ))s)"; PASS=$((PASS+1));
+else echo "FAIL: ACP client waited $(( t1 - t0 ))s for a lingering agy acp"; FAIL=$((FAIL+1)); fi
 
 echo ""
 if [ "$SKIP" -gt 0 ]; then

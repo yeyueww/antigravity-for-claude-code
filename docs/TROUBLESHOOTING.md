@@ -151,6 +151,26 @@ whether the run admits it ([#10](https://github.com/yuting0624/antigravity-for-c
 
 ---
 
+## Which transport ran? (ACP vs `--print`)
+
+Since 0.32.0, `agy-delegate` talks to agy over the Agent Client Protocol (`agy acp`) whenever it can, and
+over `agy --print` otherwise. The `AGY_USAGE` line on stderr says which: `"transport": "acp"` or `"print"`.
+`agy-doctor` reports the transport delegation will use.
+
+- **It used `print` and you expected ACP.** One of: agy has no `acp` subcommand (`agy update`), `python3`
+  is not on PATH, or the call used a print-only flag — `--read-only` / `--allow-url`, `--settings`,
+  `--json-schema`, or a prompt starting with `/` (pass `--allow-slash-commands` to send it to ACP as a
+  command). Add `--transport acp` to make the wrapper say which one instead of falling back.
+- **Why is `--read-only` print-only?** Measured on agy 1.5.9: `agy acp` accepts no settings overlay, and
+  it auto-approves `write_file` inside the workspace even with `toolPermission: "request-review"` plus a
+  `permissions.ask` rule in `settings.json`. Those writes never reach the client as a permission request,
+  so the ACP client cannot refuse them. Print mode with `--settings` does deny them.
+- **exit 15 over ACP.** The request reached the wrapper and nothing covered it. The message names the tool
+  (`denied: run_command`). Grant only that kind with `--approve execute` (or `edit`, `fetch`, … / a tool
+  name), rather than `--yolo`.
+- **Something only works on the old path.** `--transport print` (or `AGY_TRANSPORT=print`, or the
+  `transport` plugin option) restores 0.31.x behavior exactly.
+
 ## Exit codes & `AGY_SIGNAL`
 
 On classifiable failures the wrapper prints a machine-readable line to stderr:

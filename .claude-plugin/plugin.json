@@ -1,6 +1,6 @@
 {
   "name": "antigravity",
-  "version": "0.31.1",
+  "version": "0.32.0",
   "description": "Run the Antigravity CLI (Gemini) as a collaborating AI inside Claude Code, with intelligent model routing across the SDLC. Claude conducts — requirements, architecture, the hard 20%, verification, review — and routes deterministic, high-volume work (scaffolding, tests, first-pass review, migrations, web/Vertex AI Search) to Antigravity. Hybrid agentic engineering; lower token cost as a financial lever.",
   "author": {
     "name": "linyuting"
@@ -66,6 +66,12 @@
       "title": "Use agy's structured JSON output",
       "description": "When on (default), agy-delegate runs agy with --output-format json (agy >= 1.1.8, requires python3) to classify failures from the structured error and report token usage as an AGY_USAGE line on stderr. The text on stdout is unchanged. Set to off/false/0/no to force the plain-text path.",
       "default": "on"
+    },
+    "transport": {
+      "type": "string",
+      "title": "How agy-delegate talks to agy",
+      "description": "auto (default): run each delegation over the Agent Client Protocol (`agy acp`, driven by scripts/lib/agy_acp.py; needs python3), which answers permission requests per call (--approve <kinds>) and cancels a timed-out turn cleanly; falls back to `agy --print` when agy has no `acp` subcommand or a print-only flag is set (--read-only/--allow-url, --settings, --json-schema, or a leading-slash prompt). acp: require ACP (fail instead of falling back). print: always use `agy --print`. Env AGY_TRANSPORT overrides this.",
+      "default": "auto"
     },
     "digest_warn_chars": {
       "type": "string",

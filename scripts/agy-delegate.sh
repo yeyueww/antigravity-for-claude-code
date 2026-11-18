@@ -4,10 +4,21 @@
 # Part of the "Antigravity for Claude Code" plugin.
 #
 # Purpose: let Claude Code (the orchestrator) hand a single, well-scoped subtask
-# to an Antigravity (Gemini) agent via `agy --print`, and get clean text back on
-# stdout — for delegation, cross-model checks, or offloading bulk work.
+# to an Antigravity (Gemini) agent, and get clean text back on stdout — for
+# delegation, cross-model checks, or offloading bulk work.
 #
-# Why a wrapper instead of calling `agy` directly:
+# Transport. By default (`--transport auto`) the turn runs over the Agent Client
+# Protocol: `agy acp` driven by scripts/lib/agy_acp.py (JSON-RPC over stdio). The
+# client answers each permission request itself (`--approve <kinds>`), cancels a
+# timed-out turn cleanly with `session/cancel`, and prints the same JSON envelope as
+# `agy --print --output-format json`, so everything below is transport-independent.
+# auto falls back to `agy --print` when agy has no `acp` subcommand, python3 is
+# missing, or a flag ACP cannot honor is set: --json-schema, --settings, --read-only /
+# --allow-url (measured on agy 1.5.9: `agy acp` takes no settings overlay and
+# auto-approves in-workspace writes even under toolPermission=request-review), or a
+# prompt that starts with `/` while slash commands are disabled.
+#
+# Why a wrapper instead of calling `agy` directly (print transport):
 #   * `agy --print` silently drops stdout when stdin is a non-TTY -> we detach
 #     stdin (`< /dev/null`) for short prompts and pipe via a rewindable temp file
 #     (`< "$PROMPTF"` without `-p`, measured on agy 1.4.8 and 1.5.9) above 64 KB
@@ -55,7 +66,15 @@
 #       --allow-slash-commands       Keep agy's leading `/command` expansion enabled in print mode
 #                                    (by default --disable-slash-commands is passed when MODE != plan
 #                                    so literal `/clear` or `/credits` text in prompts never aborts)
-#       --print-command              Print the resolved agy command and exit (dry run; skips agy --help probe)
+#       --transport <auto|acp|print> How to talk to agy (default: auto = ACP when available, else print).
+#                                    Plugin option `transport` / env AGY_TRANSPORT set the default.
+#                                    `acp` fails (exit 1) instead of falling back when ACP can't be used.
+#       --approve <kinds>            ACP only: approve permission requests for these ACP tool kinds
+#                                    (comma list: edit, delete, move, execute, fetch, search, read,
+#                                    other, or `all`) or tool names (write_file, run_command, ...).
+#                                    Narrower than --yolo; anything not listed is denied (exit 15).
+#       --print-command              Print the resolved agy command and exit (dry run; no agy run —
+#                                    only `agy --help` is probed, to pick the transport)
 #   -h, --help                       Show this help
 #
 # Exit codes: 0 ok | 1 usage | 2 agy failed | 3 empty | 10 quota | 11 auth | 12 timeout
@@ -109,6 +128,9 @@ CONTINUE=0
 CONV_ID=""
 ALLOW_SLASH=0
 PRINT_CMD=0
+TRANSPORT="${AGY_TRANSPORT:-${CLAUDE_PLUGIN_OPTION_TRANSPORT:-auto}}"
+APPROVE=""
+ACP_CLIENT="$(cd "$(dirname "$0")" && pwd)/lib/agy_acp.py"
 DENIED_ACTIONS=""   # tool names from the envelope's denied_actions (agy 1.1.27+), for the message
 
 die() { echo "agy-delegate: $*" >&2; exit 1; }
@@ -378,8 +400,15 @@ permission_denied() {   # $1 = "shown" when the caller already echoed $ERR
     echo "agy-delegate: agy denied a tool even though --yolo (--dangerously-skip-permissions) was passed${DENIED_ACTIONS:+ — denied: $DENIED_ACTIONS} — blocked by policy and not performed. On agy 1.5.2+, Gemini Enterprise admin policy (enforce_unsandboxed_command_review, enforce_outside_workspace_file_review, or an admin permissionPreset), explicit permissions.deny rules, and the system command denylist override --dangerously-skip-permissions in headless mode. Keep file/command targets inside the workspace (--dir), inspect resolved rules with agy-doctor, or check your organization's admin policy." >&2
     signal PERMISSION_DENIED "policy_blocked: agy denied a tool despite --yolo${DENIED_ACTIONS:+ (denied: $DENIED_ACTIONS)} — blocked by enterprise admin policy or permissions.deny"
   else
+    if [ "${EFF_TRANSPORT:-print}" = "acp" ]; then
+      echo "agy-delegate: (ACP transport) the permission request reached this wrapper and was denied because no grant covered it${DENIED_ACTIONS:+ — denied: $DENIED_ACTIONS}. Approve just what the task needs with --approve <kinds> (edit, execute, fetch, ... or a tool name such as run_command) instead of --yolo." >&2
+    fi
     echo "agy-delegate: agy denied a tool that needs permission (headless can't prompt)${DENIED_ACTIONS:+ — denied: $DENIED_ACTIONS} — the denied action was not performed. For a FILE WRITE, use a permissions.allow rule covering the target in ~/.gemini/antigravity-cli/settings.json — write_file(<dir>) matches recursively beneath <dir> — or on agy 1.5.7+ pass --mode accept-edits for in-workspace writes (measured on agy 1.1.13–1.5.6, --mode accept-edits was NOT a headless write grant and was denied like a plain write; it never grants shell commands); --yolo also works and approves ALL tools. For a URL READ pass --allow-url or add read_url(<target>) (agy 1.1.28+). Other tools (web search / Vertex AI Search / terminal) need --yolo unless a rule covers them. If a rule is ALREADY in place, run agy-doctor to verify it parses." >&2
-    signal PERMISSION_DENIED "agy denied a permissioned tool in headless${DENIED_ACTIONS:+ (denied: $DENIED_ACTIONS)} — add a permissions.allow rule or pass --yolo"
+    if [ "${EFF_TRANSPORT:-print}" = "acp" ]; then
+      signal PERMISSION_DENIED "agy asked for a permission no grant covered${DENIED_ACTIONS:+ (denied: $DENIED_ACTIONS)} — pass --approve <kind> (or --yolo)"
+    else
+      signal PERMISSION_DENIED "agy denied a permissioned tool in headless${DENIED_ACTIONS:+ (denied: $DENIED_ACTIONS)} — add a permissions.allow rule or pass --yolo"
+    fi
   fi
   exit 15
 }
@@ -458,6 +487,8 @@ while [ $# -gt 0 ]; do
     --conversation)     need "$#" "$1"; CONV_ID="$2"; shift 2 ;;
     -m|--model)         need "$#" "$1"; MODEL="$2"; shift 2 ;;
     --allow-slash-commands) ALLOW_SLASH=1; shift ;;
+    --transport)        need "$#" "$1"; TRANSPORT="$2"; shift 2 ;;
+    --approve)          need "$#" "$1"; APPROVE="${APPROVE:+$APPROVE,}$2"; shift 2 ;;
     --print-command)    PRINT_CMD=1; shift ;;
     -h|--help)          usage ;;
     -)                  PROMPT="$(cat)"; shift ;;
@@ -468,6 +499,13 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$PROMPT" ] || die "no prompt given (pass a string, or '-' to read stdin)"
+TRANSPORT="$(printf '%s' "$TRANSPORT" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$TRANSPORT" in
+  ''|auto) TRANSPORT=auto ;;
+  acp|print) ;;
+  *) die "invalid --transport '$TRANSPORT' (use auto | acp | print)" ;;
+esac
+[ -n "$APPROVE" ] && [ "$TRANSPORT" = "print" ] && die "--approve needs the ACP transport (drop --transport print)"
 if [ "$PRINT_CMD" -ne 1 ] && ! command -v agy >/dev/null 2>&1; then
   echo "agy-delegate: 'agy' not found on PATH — install the Antigravity CLI first" >&2
   signal AGY_MISSING "agy not on PATH"
@@ -519,7 +557,7 @@ fi
 
 # Heads-up: a likely write task with no visible write grant (--yolo or agy 1.5.7+ --mode accept-edits).
 # Suppress when --read-only is explicitly requested.
-if [ "$YOLO" -eq 0 ] && [ "$MODE" != "accept-edits" ] && [ "$READ_ONLY" -eq 0 ] && [ "$PRINT_CMD" -ne 1 ]; then
+if [ "$YOLO" -eq 0 ] && [ "$MODE" != "accept-edits" ] && [ "$READ_ONLY" -eq 0 ] && [ -z "$APPROVE" ] && [ "$PRINT_CMD" -ne 1 ]; then
   shopt -s nocasematch
   case "$PROMPT" in
     *implement*|*scaffold*|*migrate*|*refactor*|*"write the file"*|*"create the file"*|*"edit the file"*)
@@ -542,7 +580,9 @@ HELPF=""; ERR=""; OUTF=""; RESP=""; JERR=""; JRAWERR=""; JDEN=""; PROMPTF=""
 trap 'rm -f "$HELPF" "$ERR" "$OUTF" "$RESP" "$JERR" "$JRAWERR" "$JDEN" "$PROMPTF" 2>/dev/null' EXIT
 
 HELP_OUT=""
-if [ "$PRINT_CMD" -ne 1 ]; then
+# A dry run still probes `agy --help` (when agy is on PATH) to pick the transport it
+# would use, so --print-command shows the real invocation instead of guessing.
+if [ "$PRINT_CMD" -ne 1 ] || { [ "$TRANSPORT" != "print" ] && command -v agy >/dev/null 2>&1; }; then
   HELPF="$(mktemp "${TMPDIR:-/tmp}/agy-help.XXXXXX")"
   if [ -n "$TO_CMD" ]; then
     "$TO_CMD" --kill-after=5 10 agy --help >"$HELPF" 2>&1 || true
@@ -550,6 +590,40 @@ if [ "$PRINT_CMD" -ne 1 ]; then
     agy --help >"$HELPF" 2>&1 || true
   fi
   HELP_OUT="$(cat "$HELPF" 2>/dev/null || true)"; rm -f "$HELPF"
+fi
+# `agy --help` lists `acp` under "Available subcommands" (agy 1.3+; measured on 1.5.9).
+AGY_HAS_ACP=0
+case "$HELP_OUT" in
+  *"Agent Client Protocol"*|*$'\n  acp '*) AGY_HAS_ACP=1 ;;
+esac
+# The print-mode feature probes below keep their historical dry-run behavior (no probe).
+[ "$PRINT_CMD" -eq 1 ] && HELP_OUT=""
+
+# --- choose the transport (see the header) ---
+ACP_BLOCKER=""
+if [ "$TRANSPORT" != "print" ]; then
+  if [ -n "$JSON_SCHEMA" ]; then ACP_BLOCKER="--json-schema has no ACP equivalent"
+  elif [ -n "$CUSTOM_SETTINGS" ]; then ACP_BLOCKER="--settings has no ACP equivalent (agy acp takes no settings overlay)"
+  elif [ "$READ_ONLY" -eq 1 ]; then ACP_BLOCKER="--read-only/--allow-url cannot be enforced over ACP (agy acp auto-approves in-workspace writes; measured on 1.5.9)"
+  elif [ "$ALLOW_SLASH" -eq 0 ] && [ "$MODE" != "plan" ] && [ "${PROMPT#/}" != "$PROMPT" ]; then ACP_BLOCKER="the prompt starts with '/' and ACP cannot disable slash-command expansion (pass --allow-slash-commands to send it as a command)"
+  elif ! command -v python3 >/dev/null 2>&1; then ACP_BLOCKER="python3 is not on PATH"
+  elif [ ! -f "$ACP_CLIENT" ]; then ACP_BLOCKER="ACP client missing: $ACP_CLIENT"
+  elif [ "$AGY_HAS_ACP" -ne 1 ]; then
+    if [ "$PRINT_CMD" -eq 1 ] && ! command -v agy >/dev/null 2>&1; then
+      # Dry run without agy: show what an explicit `--transport acp` would run; auto can't tell.
+      [ "$TRANSPORT" = "auto" ] && ACP_BLOCKER="agy is not on PATH (dry run)"
+    else ACP_BLOCKER="this agy has no \`acp\` subcommand (agy --help)"; fi
+  fi
+fi
+EFF_TRANSPORT=print
+if [ "$TRANSPORT" != "print" ]; then
+  if [ -z "$ACP_BLOCKER" ]; then
+    EFF_TRANSPORT=acp
+  elif [ "$TRANSPORT" = "acp" ]; then
+    die "--transport acp is not possible: $ACP_BLOCKER"
+  elif [ -n "$APPROVE" ]; then
+    die "--approve needs the ACP transport, which is not possible here: $ACP_BLOCKER"
+  fi
 fi
 
 # --- assemble agy args ---
@@ -620,6 +694,21 @@ case "$(printf '%s' "$raw_so" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     fi ;;
 esac
 
+# ACP: the client always answers with the JSON envelope (structured_output does not apply).
+# Keep `--model "$MODEL"` at ACP_ARGS[0..1] too, for the same in-place fallback update.
+ACP_ARGS=(--model "$MODEL" --timeout "$TIMEOUT")
+if [ "$EFF_TRANSPORT" = "acp" ]; then
+  JSON_MODE=1
+  [ "$PASS_RAW_EFFORT" -eq 1 ] && ACP_ARGS+=(--effort "$EFFORT")
+  for d in "${ADD_DIRS[@]:-}"; do [ -n "$d" ] && ACP_ARGS+=(--add-dir "$d"); done
+  [ "$YOLO" -eq 1 ]      && ACP_ARGS+=(--yolo)
+  [ -n "$MODE" ]         && ACP_ARGS+=(--mode "$MODE")
+  [ "$SANDBOX" -eq 1 ]   && ACP_ARGS+=(--sandbox)
+  [ "$CONTINUE" -eq 1 ]  && ACP_ARGS+=(--continue)
+  [ -n "$CONV_ID" ]      && ACP_ARGS+=(--conversation "$CONV_ID")
+  [ -n "$APPROVE" ]      && ACP_ARGS+=(--approve "$APPROVE")
+fi
+
 # --- decide prompt delivery (detach stdin up to 64 KB; temp file above 64 KB) ---
 # Linux enforces MAX_ARG_STRLEN = 131072 bytes (128 KB) per single argv string, even
 # when ARG_MAX is 2 MB, so a 130–200 KB log digest (`cloud-debug.sh`) or large `git diff`
@@ -640,7 +729,10 @@ fi
 
 # --- dry run: print the resolved (shell-quoted) agy invocation and exit ---
 if [ "$PRINT_CMD" -eq 1 ]; then
-  if [ "$PROMPT_VIA_STDIN" -eq 1 ]; then
+  if [ "$EFF_TRANSPORT" = "acp" ]; then
+    # The ACP client spawns `agy acp` itself; the prompt always travels via a file.
+    { printf 'python3'; printf ' %q' "$ACP_CLIENT" "${ACP_ARGS[@]}"; printf ' --prompt-file <prompt:%sB>  # runs: agy acp\n' "$(LC_ALL=C; printf '%s' "${#PROMPT}")"; }
+  elif [ "$PROMPT_VIA_STDIN" -eq 1 ]; then
     { printf 'agy'; printf ' %q' "${ARGS[@]}"; printf ' < <prompt-file:%sB>\n' "$prompt_bytes"; }
   else
     { printf 'agy'; printf ' %q' "${ARGS[@]}" -p "$PROMPT"; printf '\n'; }
@@ -648,7 +740,7 @@ if [ "$PRINT_CMD" -eq 1 ]; then
   exit 0
 fi
 
-if [ "$PROMPT_VIA_STDIN" -eq 1 ]; then
+if [ "$PROMPT_VIA_STDIN" -eq 1 ] || [ "$EFF_TRANSPORT" = "acp" ]; then
   PROMPTF="$(mktemp "${TMPDIR:-/tmp}/agy-prompt.XXXXXX")"
   printf '%s' "$PROMPT" >"$PROMPTF"
 fi
@@ -725,7 +817,16 @@ fi
 
 while :; do
   set +e
-  if [ "$PROMPT_VIA_STDIN" -eq 1 ]; then
+  if [ "$EFF_TRANSPORT" = "acp" ]; then
+    ACP_ARGS[1]="$MODEL"
+    if [ -n "$TO_CMD" ] && [ "$TO_SECS" -gt 0 ]; then
+      "$TO_CMD" --kill-after=10 "$TO_SECS" python3 "$ACP_CLIENT" "${ACP_ARGS[@]}" --prompt-file "$PROMPTF" < /dev/null >"$OUTF" 2>"$ERR"
+      RC=$?
+    else
+      python3 "$ACP_CLIENT" "${ACP_ARGS[@]}" --prompt-file "$PROMPTF" < /dev/null >"$OUTF" 2>"$ERR"
+      RC=$?
+    fi
+  elif [ "$PROMPT_VIA_STDIN" -eq 1 ]; then
     if [ -n "$TO_CMD" ] && [ "$TO_SECS" -gt 0 ]; then
       "$TO_CMD" --kill-after=10 "$TO_SECS" agy "${ARGS[@]}" < "$PROMPTF" >"$OUTF" 2>"$ERR"
       RC=$?
@@ -753,7 +854,7 @@ while :; do
     JRAWERR="$(mktemp "${TMPDIR:-/tmp}/agy-rawerr.XXXXXX")"
     JDEN="$(mktemp "${TMPDIR:-/tmp}/agy-den.XXXXXX")"
     meta="$(AGY_JSON="$OUT" AGY_RESP_FILE="$RESP" AGY_ERR_FILE="$JERR" AGY_RAWERR_FILE="$JRAWERR" AGY_DEN_FILE="$JDEN" \
-          AGY_MODEL="$MODEL" AGY_TIER="$USAGE_TIER" python3 - <<'PY' 2>/dev/null || true
+          AGY_MODEL="$MODEL" AGY_TIER="$USAGE_TIER" AGY_TRANSPORT_USED="$EFF_TRANSPORT" python3 - <<'PY' 2>/dev/null || true
 import json, os, sys
 raw = os.environ.get("AGY_JSON", "")
 try:
@@ -804,6 +905,10 @@ out_meta = {
 fr = one_line(d.get("finished_reason", ""))
 if fr:
     out_meta["finished_reason"] = fr
+out_meta["transport"] = os.environ.get("AGY_TRANSPORT_USED", "") or "print"
+tc = d.get("tool_calls")
+if isinstance(tc, dict):
+    out_meta["tool_calls"] = {k: tc.get(k) for k in ("total", "failed") if isinstance(tc.get(k), int)}
 print(json.dumps(out_meta))
 PY
 )"
