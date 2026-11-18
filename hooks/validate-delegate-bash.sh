@@ -213,6 +213,9 @@ cwd_real = os.path.realpath(cwd_base)
 DELEGATE_VAL_OPTS = {
     "-t", "--tier", "-e", "--effort", "--timeout", "--json-schema",
     "--mode", "--conversation", "-m", "--model",
+    # ACP transport (0.32.0): --transport is an enum; --approve names ACP tool kinds and is
+    # strictly narrower than --yolo, which this gate already lets through.
+    "--transport", "--approve",
 }
 DELEGATE_BOOL_OPTS = {
     "--read-only", "--allow-url", "--yolo", "--sandbox", "--digest",

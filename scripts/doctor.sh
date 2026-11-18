@@ -484,6 +484,30 @@ else
   info "fix: install the Antigravity CLI, then ensure its bin dir is on PATH"
 fi
 
+# 1b. delegation transport (0.32.0): ACP (`agy acp`) when available, else `agy --print`.
+if command -v agy >/dev/null 2>&1; then
+  DOC_TRANSPORT="$(printf '%s' "${AGY_TRANSPORT:-${CLAUDE_PLUGIN_OPTION_TRANSPORT:-auto}}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  # `agy --help` writes to stderr, which agy_guard discards — capture it via a file, as
+  # agy-delegate.sh does, so the probe cannot hold a capture pipe open (issue #37).
+  DOC_HELPF="$(mktemp "${TMPDIR:-/tmp}/agy-doc-help.XXXXXX")"
+  if [ -n "$TO_CMD" ]; then "$TO_CMD" --kill-after=5 10 agy --help >"$DOC_HELPF" 2>&1 </dev/null || true
+  else agy --help >"$DOC_HELPF" 2>&1 </dev/null || true; fi
+  DOC_HELP="$(cat "$DOC_HELPF" 2>/dev/null || true)"; rm -f "$DOC_HELPF"
+  DOC_ACP=0
+  case "$DOC_HELP" in *"Agent Client Protocol"*|*$'\n  acp '*) DOC_ACP=1 ;; esac
+  if [ "$DOC_TRANSPORT" = "print" ]; then
+    ok "delegation transport: print (\`agy --print\`), set by the transport option / AGY_TRANSPORT"
+  elif [ "$DOC_ACP" -ne 1 ]; then
+    warn "this agy has no \`acp\` subcommand — delegation falls back to \`agy --print\`"
+    info "fix: \`agy update\` for the ACP transport (per-request permission answers via --approve, clean timeout cancel)"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    warn "agy offers ACP but python3 is not on PATH — delegation falls back to \`agy --print\`"
+    info "fix: install python3 (the ACP client, scripts/lib/agy_acp.py, is stdlib-only)"
+  else
+    ok "delegation transport: ACP (\`agy acp\`) — print mode only for --read-only/--allow-url, --settings, --json-schema"
+  fi
+fi
+
 # 2. agy authenticated (can list models). Guarded by a wall-clock timeout so a
 #    headless/no-TTY hang (issue #6, esp. native Windows) doesn't freeze doctor
 #    and isn't misreported as "not authenticated".

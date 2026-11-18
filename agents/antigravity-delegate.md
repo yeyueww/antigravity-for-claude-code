@@ -71,7 +71,10 @@ Options: `--tier flash|flash-lo|pro` (`flash` = Gemini 4 Hydrogen High, `flash-l
 `--settings` and confines `-d`/`--dir`/`--add-dir` to `cwd`; always prefer `--dir .` over pasting code) · `--read-only` (`--allow-url` when URL reads are needed; neutralizes
 `agy 1.5.7+` default `Auto` mode) · `--mode accept-edits` (approves workspace file edits without
 terminal on `agy 1.5.7+`) · `--yolo` (approves all tools and shell commands — a grant over the machine,
-not over `--dir`) · `--sandbox` (does NOT contain anything; measured inert under
+not over `--dir`) · `--approve <kinds>` (ACP transport, the default on agy with `agy acp`:
+approves only permission requests of those ACP tool kinds — e.g. `--approve edit` to write files
+without running commands, `--approve execute` to run them — and denies the rest with exit 15;
+prefer it to `--yolo`) · `--sandbox` (does NOT contain anything; measured inert under
 `--yolo`) · `--json-schema '<schema>'` ·
 `--timeout 10m` · `-c`/`--continue` to hold state on the cheap side.
 
